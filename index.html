@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XPT Converter — SAS Transport to CSV / Excel</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
   :root{
     --bg:#0c0f14;
@@ -112,12 +113,14 @@
 
   /* Bulk bar */
   .bulk{
-    margin-top:24px;display:none;gap:10px;align-items:center;flex-wrap:wrap;
-    background:var(--panel-2);border:1px solid var(--line);border-radius:14px;padding:15px 18px;
+    margin-top:24px;display:none;flex-direction:column;gap:12px;
+    background:var(--panel-2);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
   }
   .bulk.show{display:flex}
+  .bulk .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   .bulk .lbl{font-size:13.5px;color:var(--ink-dim);margin-right:auto}
   .bulk .lbl b{color:var(--ink)}
+  .bulk-hint{font-size:12px;color:var(--ink-dim);font-family:var(--mono)}
 
   footer{margin-top:46px;text-align:center;color:var(--ink-dim);font-size:12px;font-family:var(--mono);line-height:1.7}
   footer a{color:var(--amber)}
@@ -137,7 +140,7 @@
   <header>
     <span class="badge">SAS Transport · Local · Private</span>
     <h1>XPT&nbsp;<span class="glow">Converter</span></h1>
-    <p class="sub">Drop your <b>.xpt</b> files below. Everything runs inside your browser — no upload, no server. Pick <b>CSV</b> or <b>Excel</b> per file and it downloads straight to your computer.</p>
+    <p class="sub">Drop your <b>.xpt</b> files below. Everything runs inside your browser — no upload, no server. Download files individually, or grab them all at once in a single ZIP.</p>
   </header>
 
   <div class="drop" id="drop" role="button" tabindex="0" aria-label="Upload XPT files">
@@ -148,10 +151,13 @@
   <input type="file" id="fileInput" accept=".xpt" multiple>
 
   <div class="bulk" id="bulk">
-    <span class="lbl">Convert <b id="bulkCount">0</b> files at once:</span>
-    <button class="btn btn-csv" id="allCsv">↓ All as CSV</button>
-    <button class="btn btn-xls" id="allXls">↓ All as Excel</button>
-    <button class="btn btn-ghost" id="clearAll">Clear list</button>
+    <div class="row">
+      <span class="lbl">Download <b id="bulkCount">0</b> files together as one archive:</span>
+      <button class="btn btn-csv" id="allCsv">↓ Download all in CSV</button>
+      <button class="btn btn-xls" id="allXls">↓ Download all in Excel</button>
+      <button class="btn btn-ghost" id="clearAll">Clear list</button>
+    </div>
+    <div class="bulk-hint" id="bulkHint">Bundled as a single .zip — opens with WinRAR, 7-Zip, Windows Explorer, or Mac Finder.</div>
   </div>
 
   <div class="files" id="files"></div>
@@ -287,6 +293,24 @@ function toCSV(columns, rows){
   return lines.join('\r\n');
 }
 
+function workbookArray(fileEntry){
+  // build a SheetJS workbook (one sheet per dataset) and return it as a Uint8Array
+  const wb = XLSX.utils.book_new();
+  const used = {};
+  fileEntry.datasets.forEach((d,i)=>{
+    const aoa = [d.columns, ...d.rows.map(r=>d.columns.map(c=>r[c]))];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    let sheetName = (d.name || ('Sheet'+(i+1))).substring(0,31).replace(/[\\\/\?\*\[\]:]/g,'_');
+    if (!sheetName) sheetName = 'Sheet'+(i+1);
+    // guard against duplicate sheet names
+    let base = sheetName, n = 2;
+    while (used[sheetName]){ sheetName = (base.substring(0,28)+'_'+n).substring(0,31); n++; }
+    used[sheetName] = true;
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  });
+  return XLSX.write(wb, { type:'array', bookType:'xlsx' });
+}
+
 function downloadBlob(blob, filename){
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -298,13 +322,29 @@ function downloadBlob(blob, filename){
 
 function baseName(name){ return name.replace(/\.[^.]+$/,''); }
 
+// keep names unique inside a zip
+function makeUniquer(){
+  const seen = {};
+  return (name)=>{
+    if (!seen[name]){ seen[name]=1; return name; }
+    const dot = name.lastIndexOf('.');
+    const stem = dot>0 ? name.slice(0,dot) : name;
+    const ext  = dot>0 ? name.slice(dot) : '';
+    let n = seen[name] + 1; seen[name] = n;
+    let cand = stem+'_'+n+ext;
+    while (seen[cand]){ n++; cand = stem+'_'+n+ext; }
+    seen[cand] = 1;
+    return cand;
+  };
+}
+
+/* ---- Single-file downloads (specific file) ---- */
 function exportCSV(fileEntry){
   const ds = fileEntry.datasets;
   if (ds.length === 1){
     const csv = toCSV(ds[0].columns, ds[0].rows);
     downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8;'}), baseName(fileEntry.name)+'.csv');
   } else {
-    // multiple members -> one CSV each
     ds.forEach((d,i)=>{
       const csv = toCSV(d.columns, d.rows);
       downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8;'}),
@@ -314,15 +354,38 @@ function exportCSV(fileEntry){
 }
 
 function exportXLSX(fileEntry){
-  const wb = XLSX.utils.book_new();
-  fileEntry.datasets.forEach((d,i)=>{
-    const aoa = [d.columns, ...d.rows.map(r=>d.columns.map(c=>r[c]))];
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    let sheetName = (d.name || ('Sheet'+(i+1))).substring(0,31).replace(/[\\\/\?\*\[\]:]/g,'_');
-    if (!sheetName) sheetName = 'Sheet'+(i+1);
-    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  const data = workbookArray(fileEntry);
+  downloadBlob(new Blob([data],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}),
+    baseName(fileEntry.name)+'.xlsx');
+}
+
+/* ---- Bulk downloads (all files in one ZIP) ---- */
+async function exportAllCSVZip(fileEntries){
+  const zip = new JSZip();
+  const uniq = makeUniquer();
+  fileEntries.forEach(fe=>{
+    const ds = fe.datasets;
+    if (ds.length === 1){
+      zip.file(uniq(baseName(fe.name)+'.csv'), toCSV(ds[0].columns, ds[0].rows));
+    } else {
+      ds.forEach((d,i)=>{
+        const fname = baseName(fe.name)+'__'+(d.name||('member'+(i+1)))+'.csv';
+        zip.file(uniq(fname), toCSV(d.columns, d.rows));
+      });
+    }
   });
-  XLSX.writeFile(wb, baseName(fileEntry.name)+'.xlsx');
+  const blob = await zip.generateAsync({ type:'blob', compression:'DEFLATE' });
+  downloadBlob(blob, 'xpt-converted-csv.zip');
+}
+
+async function exportAllXLSXZip(fileEntries){
+  const zip = new JSZip();
+  const uniq = makeUniquer();
+  fileEntries.forEach(fe=>{
+    zip.file(uniq(baseName(fe.name)+'.xlsx'), workbookArray(fe));
+  });
+  const blob = await zip.generateAsync({ type:'blob', compression:'DEFLATE' });
+  downloadBlob(blob, 'xpt-converted-excel.zip');
 }
 
 /* ============================================================
@@ -333,6 +396,9 @@ const fileInput = document.getElementById('fileInput');
 const filesEl = document.getElementById('files');
 const bulk = document.getElementById('bulk');
 const bulkCount = document.getElementById('bulkCount');
+const bulkHint = document.getElementById('bulkHint');
+const allCsvBtn = document.getElementById('allCsv');
+const allXlsBtn = document.getElementById('allXls');
 
 let entries = []; // {id,name,size,datasets|null,error|null}
 let nextId = 1;
@@ -447,16 +513,27 @@ function render(){
 
   const ready = entries.filter(e=>e.datasets);
   bulkCount.textContent = ready.length;
-  bulk.classList.toggle('show', entries.length>0);
-  document.getElementById('allCsv').disabled = ready.length===0;
-  document.getElementById('allXls').disabled = ready.length===0;
+  // Bulk archive bar only makes sense for 2+ converted files
+  bulk.classList.toggle('show', ready.length >= 2);
+  allCsvBtn.disabled = ready.length < 2;
+  allXlsBtn.disabled = ready.length < 2;
 }
 
-document.getElementById('allCsv').onclick = ()=>{
-  entries.filter(e=>e.datasets).forEach((e,i)=>setTimeout(()=>exportCSV(e), i*250));
+async function withBusy(btn, label, fn){
+  const original = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = label;
+  try { await fn(); }
+  catch(err){ alert('Could not build the ZIP: ' + (err.message||err)); }
+  finally { btn.innerHTML = original; btn.disabled = false; render(); }
+}
+
+allCsvBtn.onclick = ()=>{
+  const ready = entries.filter(e=>e.datasets);
+  withBusy(allCsvBtn, '⏳ Zipping…', ()=>exportAllCSVZip(ready));
 };
-document.getElementById('allXls').onclick = ()=>{
-  entries.filter(e=>e.datasets).forEach((e,i)=>setTimeout(()=>exportXLSX(e), i*250));
+allXlsBtn.onclick = ()=>{
+  const ready = entries.filter(e=>e.datasets);
+  withBusy(allXlsBtn, '⏳ Zipping…', ()=>exportAllXLSXZip(ready));
 };
 document.getElementById('clearAll').onclick = ()=>{ entries=[]; render(); };
 
